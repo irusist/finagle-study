@@ -34,8 +34,8 @@ object HttpClient {
   def main(args : Array[String]) {
     val clientWithoutErrorHandling : Service[HttpRequest, HttpResponse] = ClientBuilder()
     .codec(Http())
-    .hosts(new InetSocketAddress(8080))
-    .hostConnectionLimit(1)
+    .hosts("www.jd.com:80")
+    .hostConnectionLimit(2)
     .build()
 
     val handleErrors = new HandleErrors
@@ -56,6 +56,7 @@ object HttpClient {
     val authorizedRequest = new DefaultHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.GET, "/")
 
     authorizedRequest.addHeader("Authorization", "open seame")
+   // authorizedRequest.addHeader("Host", "www.jd.com")
 
     client(authorizedRequest) onSuccess {
       response =>

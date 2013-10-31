@@ -1,0 +1,3 @@
+service Hello {
+    string hi();
+}
