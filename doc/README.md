@@ -591,5 +591,246 @@ Finagle也提供了一些有用的统计信息用来监控连接池，负载均�
     import com.twitter.util.FutureEventListener;
     import com.twitter.util.FutureTransformer;
 
+### Performing Synchronous Operations
+如果服务端要同步响应请求，可以使用下面的形式来实现service
 
+    public class HTTPServer extends Service<HttpRequest, HttpResponse> {
+        public Future<HttpResponse> apply(HttpRequest request) {
+            // If I can generate the response synchronously , then I just do this.
+            try {
+                HttpResponse response = processRequest(request);
+                return Future.value(response);
+            } catch (MyException e) {
+                return Future.exception(e);
+            }
+        }
+    }
+在这个例子中，`try` `catch`块导致服务端要么返回一个响应，要么返回一个异常。
 
+###　Chaining Asynchronous Operations
+在Java中，可以调用`Future`对象的`transformedBy`方法来操作多个异步的操作。它是通过提供一个`FutureTransformer`对象给`Future`对象的`transformedBy`方法。
+通常实现`FutureTransformer`的`map`方法来执行特定的转换，`FutureTransformer`的`handle`方法在发生异常时被调用。下面的例子显示了这种情况。
+
+    public class HTTPServer extends Service<HttpRequest, HttpResponse> {
+        private Future<String> getContentAsync(HttpRequest request) {
+            // asynchronously gets content, possibly by submitting
+            // a function to a FuturePool
+            ...
+        }
+
+        public Future<HttpResponse> apply(HttpRequest, request) {
+            Future<String> contentFuture = getContentAsync(request);
+            return contentFuture.transformedBy(new FutureTransformer<String, HttpResponse>() {
+                @Override
+                public HttpResponse map(String content) {
+                    HttpResponse httpResponse = new DefaultHttpResponse(HttpVersion.HTTP_1_1, HttpResponseStatus.OK);
+                    httpResponse.setContent(ChannelBuffers.wrappedBuffer(content.getBytes()));
+                    return httpResponse;
+                }
+
+                @Override
+                public HttpResponse handle(Throwable throwable) {
+                    HttpResponse httpResponse =
+                        new DefaultHttpResponse(HttpVersion.HTTP_1_1, HttpResponseStatus.SERVICE_UNAVAILABLE);
+                    httpResponse.setContent(ChannelBuffers.wrappedBuffer(throwable.toString().getBytes()));
+                    return httpResponse;
+                }
+            })
+        }
+    }
+
+### Invoking the Server
+下面的例子显示了实例化和执行一个server。调用`ServerBuilder`的`safeBuild`方法可以静态类型检查`ServerBuilder`的方法，这样就可以防止如果一个需要的参数缺失而造成的运行时异常。
+
+    public static void main(String[] args) {
+        ServerBuilder.safeBuild(new HttpServer(), ServerBuilder.get()
+                                        .codec(Http.get())
+                                        .name("HttpServer")
+                                        .bindTo(new InetSocketAddress("localhost", 8080)));
+    }
+
+## 在Java中创建客户端
+在Java中要创建客户端，有几种选择。可以创建一个客户端同步或异步地处理响应。必须选择一个合适的级别来处理异常。这部分显示了一些在用Java来写客户端的技术。
+
+### Client Imports
+
+    import java.net.InetSocketAddress;
+    import java.util.concurrent.TimeUnit;
+
+    import org.jboss.netty.handler.codec.http.DefaultHttpRequest;
+    import org.jboss.netty.handler.codec.http.HttpMethod;
+    import org.jboss.netty.handler.codec.http.HttpRequest;
+    import org.jboss.netty.handler.codec.http.HttpResponse;
+    import org.jboss.netty.handler.codec.http.HttpVersion;
+
+    import com.twitter.finagle.Service;
+    import com.twitter.finagle.builder.ClientBuilder;
+    import com.twitter.finagle.http.Http;
+    import com.twitter.util.Duration;
+    import com.twitter.util.FutureEventListener;
+    import com.twitter.util.Throw;
+    import com.twitter.util.Try;
+
+### Creating the Client
+下面的例子显示了客户端的实例化和调用。调用`ClientBuilder`的`safeBuild`方法用来静态类型检查`ClientBuilder`的参数，防止由于缺少必要参数而引起的运行时异常。
+
+    public class HTTPClient {
+        public static void main(String[] args) {
+            Service<HttpRequest, HttpResponse> httpClient =
+                ClientBuilder.safeBuild(
+                    ClientBuilder.get()
+                            .codec(Http.get())
+                            .hosts(new InetSocketAddress(8080))
+                            .hostConnectionLimit(1));
+        }
+    }
+注意：选择`hostConnectionLimit`的值为1对一个host来消除冲突。
+
+### Handling Synchronous Response
+最简单的情况下，你空余等待响应，可能永远等待。通常，你通常需要处理一个正确的响应和异常。
+
+    HttpRequest request = new DefaultHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.GET, "/");
+
+    try {
+        HttpResponse response1 = httpClient.apply(request).apply();
+    } catch(Exception e) {
+        ...
+    }
+
+### Handling Synchronous Response With Timeouts
+为了防止永远等待一个响应，可以指定一个间隔时间，如果等待时间过了会抛出一个异常。下面的例子设置了1秒的间隔时间：
+
+    try {
+        HttpResponse response2 = httpClient.apply(request).apply(new Duration(TimeUnit.SECONDS.toNanos(1)));
+    } catch (Exception e) {
+        ...
+    }
+### Handling Synchronous Response with Exception Handling
+使用`com.twitter.util`的`Try`和`Throw`类来实现一个一般的为同步响应处理异常的目标。除了要定义一个超时间隔时间外，它可能抛出异常，也可以抛出其他异常：
+
+    Try<HttpResponse> responseTry = httpClient.apply(request).get(
+        new Duration(TimeUnit.SECONDS.toNanos(1)));
+    if (responseTry.isReturn()) {
+        httpResponse response3 = responseTry.get();
+        ...
+    } else {
+        // Throw an exception
+        Throwable throwable = ((Throw)responseTry).e();
+        System.out.println("Exception thrown by client: " + throwable);
+    }
+
+注意：必须调用request的`get`方法，而不是`apply`方法来获取`Try`对象。
+
+### Handling Asynchronous Responses
+为了处理异步的响应，可以为响应添加一个`FutureEventListener`, Finagle调用`onSuccess`方法当响应到达，或者调用`onFailure`方法当出现异常：
+
+    httpClient.apply(request).addEventListener(new FutureEventListener<HttpResponse>() {
+          @Override
+          public void onSuccess(HttpResponse response4) {
+            // Cool, I have a response, do something with it!
+            ...
+          }
+
+          @Override
+          public void onFailure(Throwable throwable) {
+            System.out.println("Exception thrown by client: " +  throwable);
+          }
+        });
+      }
+    }
+
+##　Implementing a Thread Pool for Blocking Operations in Java
+为了防止阻塞操作在Finagle的主线程执行，你必须用Scala的闭包来包装阻塞操作，并且在你自己创建的Java线程中执行这个闭包。通常，自己定义的Java线程是线程池的一部分。
+下面的部分显示怎么包装阻塞操作，建立线程池，并且在线程池里的一个线程中执行阻塞操作：
+
+   * Wrapping the Blocking Operation
+   * Setting Up Your Thread Pool
+   * Invoking the Blocking Operation
+注意：Jakob Homan提供了一个实现线程池执行Scala闭包的例子在[GitHub](https://github.com/jghoman/finagle-java-example)
+
+### Wrapping the Blocking Operation
+`util`项目包含了一个`Function0`类来表示一个Scala闭包，你可以重写`apply`方法来包装阻塞操作：
+
+    public static class BlockingOperation extends com.twitter.util.Function0<Integer> {
+      public Integer apply() {
+        // Implement your blocking operation here
+        ...
+      }
+    }
+
+### Setting Up Your Thread Pool
+下面的例子显示了一个Thrift服务将阻塞操作放在`Function0`对象的`apply`方法中，它将在Java的线程池中执行并且返回结果。
+
+    public static class HelloServer implements Hello.ServiceIface {
+      ExecutorService pool = Executors.newFixedThreadPool(4);                     // Java thread pool
+      ExecutorServiceFuturePool futurePool = new ExecutorServiceFuturePool(pool); // Java Future thread pool
+
+      public Future<Integer> blockingOperation() {
+          Function0<Integer> blockingWork = new BlockingOperation();
+        return futurePool.apply(blockingWork);
+      }
+
+      public static void main(String[] args) {
+        Hello.ServiceIface processor = new Hello.ServiceIface();
+
+        ServerBuilder.safeBuild(
+          new Hello.Service(processor, new TBinaryProtocol.Factory()),
+          ServerBuilder.get()
+                       .name("HelloService")
+                       .codec(ThriftServerFramedCodec.get())
+                       .bindTo(new InetSocketAddress(8080))
+          );
+        )
+      )
+    )
+
+### Invoking the Blocking Operation
+为了执行阻塞操作，你可以包装阻塞操作的方法，并且添加一个事件监听器来等待成功或失败。
+
+     Service<ThriftClientRequest, byte[]> client = ClientBuilder.safeBuild(ClientBuilder.get()
+            .hosts(new InetSocketAddress(8080))
+            .codec(new ThriftClientFramedCodecFactory())
+            .hostConnectionLimit(100)); // Must be more than 1 to enable parallel execution
+
+          Hello.ServiceIface client =
+            new Hello.ServiceToClient(client, new TBinaryProtocol.Factory());
+
+          client.blockingOperation().addEventListener(new FutureEventListener<Integer>() {
+            public void onSuccess(Integer i) {
+              System.out.println(i);
+            }
+
+          public void onFailure(Throwable t) {
+            System.out.println("Exception! ", t.toString());
+          });
+
+http://semver.org/
+http://preshing.com/
+http://www.programcreek.com/2013/08/top-books-for-advanced-level-java-developers/
+
+https://github.com/CuGBabyBeaR/Interview-questions/tree/master/twitter-puddle
+https://github.com/jxzhuge12/interview/tree/master/twitter_interview
+## 额外的例子
+
+   * [Echo](https://github.com/twitter/finagle/tree/master/finagle-example/src/main/scala/com/twitter/finagle/example/echo)
+   * [Http](https://github.com/twitter/finagle/tree/master/finagle-example/src/main/scala/com/twitter/finagle/example/http)
+   * [Memcached Proxy](https://github.com/twitter/finagle/tree/master/finagle-example/src/main/scala/com/twitter/finagle/example/memcachedproxy)
+   * [Stream](https://github.com/twitter/finagle/tree/master/finagle-example/src/main/scala/com/twitter/finagle/example/stream)
+   * [Spritzer 2 Kestrel](https://github.com/twitter/finagle/tree/master/finagle-example/src/main/scala/com/twitter/finagle/example/spritzer2kestrel)
+   * [Stress](https://github.com/twitter/finagle/tree/master/finagle-example/src/main/scala/com/twitter/finagle/example/stress)
+   * [Thrift](https://github.com/twitter/finagle/tree/master/finagle-example/src/main/scala/com/twitter/finagle/example/thrift)
+   * [Kestrel Client](https://github.com/twitter/finagle/tree/master/finagle-example/src/main/scala/com/twitter/finagle/example/kestrel)
+
+## 一些资源：
+http://monkey.org/~marius/talks/twittersystems/#1
+http://blog.oskarsson.nu/post/40196324612/the-twitter-stack
+https://thenewcircle.com/s/post/1416/twitter_finagle_for_the_asynchronous_programmer_matt_ho_video
+https://groups.google.com/forum/?hl=en#!forum/finaglers
+
+https://github.com/mariusaeriksen
+
+https://github.com/capotej/finatra
+https://github.com/novus/unfinagled
+https://github.com/mairbek/finagle-postgres
+https://github.com/sprsquish/finagle-irc
+https://github.com/sprsquish/finagle-websocket
